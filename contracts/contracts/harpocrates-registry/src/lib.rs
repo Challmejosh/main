@@ -1,0 +1,527 @@
+#![no_std]
+
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val, Vec as SorobanVec,
+};
+
+const TIER_SILENT_WITNESS: u32 = 1;
+const TIER_CONSISTENT_SOURCE: u32 = 2;
+const TIER_PUBLIC_SEAL: u32 = 3;
+
+const STATUS_REGISTERED: u32 = 1;
+const STATUS_REVOKED: u32 = 2;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofRecord {
+    pub video_hash: BytesN<32>,
+    pub metadata_hash: BytesN<32>,
+    pub tier: u32,
+    pub status: u32,
+    pub created_at: u64,
+    pub source: Option<Address>,
+    pub issuer: Option<Address>,
+    pub nullifier: Option<BytesN<32>>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerRecord {
+    pub metadata_hash: BytesN<32>,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRootRecord {
+    pub metadata_hash: BytesN<32>,
+    pub active: bool,
+    pub issued_at: u64,
+}
+
+#[contractevent(topics = ["proof", "reg"])]
+pub struct ProofRegistered {
+    #[topic]
+    pub proof_id: BytesN<32>,
+    pub video_hash: BytesN<32>,
+    pub tier: u32,
+    pub status: u32,
+}
+
+#[contractevent(topics = ["proof", "revoke"])]
+pub struct ProofRevoked {
+    #[topic]
+    pub proof_id: BytesN<32>,
+    pub status: u32,
+}
+
+#[contractevent(topics = ["issuer", "add"])]
+pub struct IssuerAdded {
+    #[topic]
+    pub issuer: Address,
+    pub metadata_hash: BytesN<32>,
+}
+
+#[contractevent(topics = ["issuer", "revoke"])]
+pub struct IssuerRevoked {
+    #[topic]
+    pub issuer: Address,
+}
+
+#[contractevent(topics = ["verif", "set"])]
+pub struct VerifierSet {
+    #[topic]
+    pub verifier: Address,
+}
+
+#[contractevent(topics = ["credroot", "add"])]
+pub struct CredentialRootAdded {
+    #[topic]
+    pub credential_root: BytesN<32>,
+    pub metadata_hash: BytesN<32>,
+    pub issued_at: u64,
+}
+
+#[contractevent(topics = ["credroot", "revoke"])]
+pub struct CredentialRootRevoked {
+    #[topic]
+    pub credential_root: BytesN<32>,
+}
+
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    Proof(BytesN<32>),
+    Video(BytesN<32>),
+    Nullifier(BytesN<32>),
+    CredentialRoot(BytesN<32>),
+    Issuer(Address),
+    Verifier,
+}
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RegistryError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    DuplicateProof = 4,
+    DuplicateVideo = 5,
+    DuplicateNullifier = 6,
+    InvalidProof = 7,
+    UnknownIssuer = 8,
+    VerifierNotSet = 9,
+    InvalidPublicInputs = 10,
+    UnknownCredentialRoot = 11,
+    RevokedCredentialRoot = 12,
+}
+
+#[contract]
+pub struct HarpocratesRegistry;
+
+#[contractimpl]
+impl HarpocratesRegistry {
+    pub fn init(env: Env, admin: Address) {
+        if env.storage().persistent().has(&DataKey::Admin) {
+            panic_with_error!(&env, RegistryError::AlreadyInitialized);
+        }
+
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+    }
+
+    pub fn add_issuer(env: Env, admin: Address, issuer: Address, metadata_hash: BytesN<32>) {
+        require_admin(&env, &admin);
+
+        env.storage().persistent().set(
+            &DataKey::Issuer(issuer.clone()),
+            &IssuerRecord {
+                metadata_hash: metadata_hash.clone(),
+                active: true,
+            },
+        );
+        IssuerAdded {
+            issuer,
+            metadata_hash,
+        }
+        .publish(&env);
+    }
+
+    pub fn set_verifier(env: Env, admin: Address, verifier: Address) {
+        require_admin(&env, &admin);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Verifier, &verifier);
+        VerifierSet { verifier }.publish(&env);
+    }
+
+    pub fn get_verifier(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Verifier)
+    }
+
+    pub fn add_credential_root(
+        env: Env,
+        admin: Address,
+        credential_root: BytesN<32>,
+        metadata_hash: BytesN<32>,
+    ) {
+        require_admin(&env, &admin);
+
+        let issued_at = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &DataKey::CredentialRoot(credential_root.clone()),
+            &CredentialRootRecord {
+                metadata_hash: metadata_hash.clone(),
+                active: true,
+                issued_at,
+            },
+        );
+        CredentialRootAdded {
+            credential_root,
+            metadata_hash,
+            issued_at,
+        }
+        .publish(&env);
+    }
+
+    pub fn revoke_credential_root(env: Env, admin: Address, credential_root: BytesN<32>) {
+        require_admin(&env, &admin);
+
+        let mut record = get_credential_root_record(&env, &credential_root);
+        record.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CredentialRoot(credential_root.clone()), &record);
+        CredentialRootRevoked { credential_root }.publish(&env);
+    }
+
+    pub fn get_credential_root(
+        env: Env,
+        credential_root: BytesN<32>,
+    ) -> Option<CredentialRootRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CredentialRoot(credential_root))
+    }
+
+    pub fn revoke_issuer(env: Env, admin: Address, issuer: Address) {
+        require_admin(&env, &admin);
+
+        let mut record = get_issuer_record(&env, &issuer);
+        record.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &record);
+        IssuerRevoked { issuer }.publish(&env);
+    }
+
+    pub fn register_anonymous(
+        env: Env,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        proof_id: BytesN<32>,
+        nullifier: BytesN<32>,
+        credential_root: BytesN<32>,
+        proof: Bytes,
+    ) -> ProofRecord {
+        require_unique(&env, &proof_id, &video_hash);
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Nullifier(nullifier.clone()))
+        {
+            panic_with_error!(&env, RegistryError::DuplicateNullifier);
+        }
+
+        if !verify_demo_zk_boundary(&proof, &credential_root) {
+            panic_with_error!(&env, RegistryError::InvalidProof);
+        }
+        require_active_credential_root(&env, &credential_root);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nullifier(nullifier.clone()), &true);
+
+        save_record(
+            &env,
+            &proof_id,
+            ProofRecord {
+                video_hash,
+                metadata_hash,
+                tier: TIER_SILENT_WITNESS,
+                status: STATUS_REGISTERED,
+                created_at: env.ledger().timestamp(),
+                source: None,
+                issuer: None,
+                nullifier: Some(nullifier),
+            },
+        )
+    }
+
+    pub fn register_anonymous_verified(
+        env: Env,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        proof_id: BytesN<32>,
+        public_inputs: Bytes,
+        proof: Bytes,
+    ) -> ProofRecord {
+        require_unique(&env, &proof_id, &video_hash);
+
+        let parsed = parse_silent_witness_public_inputs(&env, &public_inputs);
+        if parsed.video_hash != video_hash {
+            panic_with_error!(&env, RegistryError::InvalidPublicInputs);
+        }
+        require_active_credential_root(&env, &parsed.credential_root);
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
+        {
+            panic_with_error!(&env, RegistryError::DuplicateNullifier);
+        }
+
+        let verifier: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verifier)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+        verify_external_proof(&env, &verifier, public_inputs, proof);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+
+        save_record(
+            &env,
+            &proof_id,
+            ProofRecord {
+                video_hash,
+                metadata_hash,
+                tier: TIER_SILENT_WITNESS,
+                status: STATUS_REGISTERED,
+                created_at: env.ledger().timestamp(),
+                source: None,
+                issuer: None,
+                nullifier: Some(parsed.nullifier),
+            },
+        )
+    }
+
+    pub fn register_source(
+        env: Env,
+        source: Address,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        proof_id: BytesN<32>,
+    ) -> ProofRecord {
+        source.require_auth();
+        require_unique(&env, &proof_id, &video_hash);
+
+        save_record(
+            &env,
+            &proof_id,
+            ProofRecord {
+                video_hash,
+                metadata_hash,
+                tier: TIER_CONSISTENT_SOURCE,
+                status: STATUS_REGISTERED,
+                created_at: env.ledger().timestamp(),
+                source: Some(source),
+                issuer: None,
+                nullifier: None,
+            },
+        )
+    }
+
+    pub fn register_seal(
+        env: Env,
+        issuer: Address,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        proof_id: BytesN<32>,
+    ) -> ProofRecord {
+        issuer.require_auth();
+        require_unique(&env, &proof_id, &video_hash);
+
+        let issuer_record = get_issuer_record(&env, &issuer);
+        if !issuer_record.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+
+        save_record(
+            &env,
+            &proof_id,
+            ProofRecord {
+                video_hash,
+                metadata_hash,
+                tier: TIER_PUBLIC_SEAL,
+                status: STATUS_REGISTERED,
+                created_at: env.ledger().timestamp(),
+                source: None,
+                issuer: Some(issuer),
+                nullifier: None,
+            },
+        )
+    }
+
+    pub fn revoke_proof(env: Env, admin: Address, proof_id: BytesN<32>) {
+        require_admin(&env, &admin);
+
+        let mut record = get_proof_record(&env, &proof_id);
+        record.status = STATUS_REVOKED;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proof(proof_id.clone()), &record);
+        ProofRevoked {
+            proof_id,
+            status: STATUS_REVOKED,
+        }
+        .publish(&env);
+    }
+
+    pub fn get_proof(env: Env, proof_id: BytesN<32>) -> Option<ProofRecord> {
+        env.storage().persistent().get(&DataKey::Proof(proof_id))
+    }
+
+    pub fn get_by_video(env: Env, video_hash: BytesN<32>) -> Option<ProofRecord> {
+        let proof_id: Option<BytesN<32>> =
+            env.storage().persistent().get(&DataKey::Video(video_hash));
+        proof_id.and_then(|id| env.storage().persistent().get(&DataKey::Proof(id)))
+    }
+
+    pub fn has_nullifier(env: Env, nullifier: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Nullifier(nullifier))
+    }
+
+    pub fn get_issuer(env: Env, issuer: Address) -> Option<IssuerRecord> {
+        env.storage().persistent().get(&DataKey::Issuer(issuer))
+    }
+}
+
+fn require_admin(env: &Env, candidate: &Address) {
+    let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+    let admin = admin.unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+
+    candidate.require_auth();
+    if &admin != candidate {
+        panic_with_error!(env, RegistryError::Unauthorized);
+    }
+}
+
+fn require_unique(env: &Env, proof_id: &BytesN<32>, video_hash: &BytesN<32>) {
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::Proof(proof_id.clone()))
+    {
+        panic_with_error!(env, RegistryError::DuplicateProof);
+    }
+
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::Video(video_hash.clone()))
+    {
+        panic_with_error!(env, RegistryError::DuplicateVideo);
+    }
+}
+
+fn get_proof_record(env: &Env, proof_id: &BytesN<32>) -> ProofRecord {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Proof(proof_id.clone()))
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::DuplicateProof))
+}
+
+fn get_issuer_record(env: &Env, issuer: &Address) -> IssuerRecord {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Issuer(issuer.clone()))
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownIssuer))
+}
+
+fn get_credential_root_record(env: &Env, credential_root: &BytesN<32>) -> CredentialRootRecord {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CredentialRoot(credential_root.clone()))
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownCredentialRoot))
+}
+
+fn require_active_credential_root(env: &Env, credential_root: &BytesN<32>) {
+    let record = get_credential_root_record(env, credential_root);
+    if !record.active {
+        panic_with_error!(env, RegistryError::RevokedCredentialRoot);
+    }
+}
+
+fn save_record(env: &Env, proof_id: &BytesN<32>, record: ProofRecord) -> ProofRecord {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Proof(proof_id.clone()), &record);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Video(record.video_hash.clone()), proof_id);
+    ProofRegistered {
+        proof_id: proof_id.clone(),
+        video_hash: record.video_hash.clone(),
+        tier: record.tier,
+        status: record.status,
+    }
+    .publish(env);
+    record
+}
+
+struct SilentWitnessInputs {
+    video_hash: BytesN<32>,
+    credential_root: BytesN<32>,
+    nullifier: BytesN<32>,
+}
+
+fn parse_silent_witness_public_inputs(env: &Env, public_inputs: &Bytes) -> SilentWitnessInputs {
+    if public_inputs.len() != 128 {
+        panic_with_error!(env, RegistryError::InvalidPublicInputs);
+    }
+
+    let mut bytes = [0u8; 128];
+    public_inputs.copy_into_slice(&mut bytes);
+
+    let mut video_hash = [0u8; 32];
+    video_hash[..16].copy_from_slice(&bytes[16..32]);
+    video_hash[16..].copy_from_slice(&bytes[48..64]);
+
+    let mut nullifier = [0u8; 32];
+    nullifier.copy_from_slice(&bytes[96..128]);
+
+    let mut credential_root = [0u8; 32];
+    credential_root.copy_from_slice(&bytes[64..96]);
+
+    SilentWitnessInputs {
+        video_hash: BytesN::from_array(env, &video_hash),
+        credential_root: BytesN::from_array(env, &credential_root),
+        nullifier: BytesN::from_array(env, &nullifier),
+    }
+}
+
+fn verify_external_proof(env: &Env, verifier: &Address, public_inputs: Bytes, proof: Bytes) {
+    let mut args: SorobanVec<Val> = SorobanVec::new(env);
+    args.push_back(public_inputs.into_val(env));
+    args.push_back(proof.into_val(env));
+
+    env.try_invoke_contract::<(), InvokeError>(verifier, &Symbol::new(env, "verify_proof"), args)
+        .unwrap_or_else(|_| panic_with_error!(env, RegistryError::InvalidProof))
+        .unwrap_or_else(|_| panic_with_error!(env, RegistryError::InvalidProof));
+}
+
+fn verify_demo_zk_boundary(proof: &Bytes, credential_root: &BytesN<32>) -> bool {
+    proof.len() > 0 && credential_root.len() == 32
+}
+
+mod test;
