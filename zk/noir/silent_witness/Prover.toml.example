@@ -1,0 +1,9 @@
+# Private inputs. These are known only to the prover.
+credential_secret = "12345"
+nullifier_secret = "67890"
+
+# Public inputs. These are included in the proof statement.
+video_hash_hi = "1"
+video_hash_lo = "2"
+credential_root = "0"
+nullifier = "0"
