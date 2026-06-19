@@ -1008,3 +1008,7 @@ code {
     padding: 24px 20px;
   }
 }
+
+.topbar:not(.scrolled) .network-pill {
+  opacity: 0.72;
+}
