@@ -445,7 +445,7 @@ function App() {
       </section>
 
       <section className="tech-strip">
-        <dl className="tech-specs">
+        <dl className="tech-specs" aria-label="Technical specification">
           <div><dt>Proof system</dt><dd>Noir UltraHonk</dd></div>
           <div><dt>Hash commitment</dt><dd>SHA-256</dd></div>
           <div><dt>On-chain registry</dt><dd>Soroban</dd></div>
