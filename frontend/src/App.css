@@ -1012,3 +1012,9 @@ code {
 .topbar:not(.scrolled) .network-pill {
   opacity: 0.72;
 }
+
+@media (max-width: 480px) {
+  .tech-specs {
+    grid-template-columns: 1fr;
+  }
+}
